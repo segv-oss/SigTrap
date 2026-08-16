@@ -1,0 +1,10 @@
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Go / Backend
+backend/bin/
+
+# OS / Environment
+.DS_Store
+.env
