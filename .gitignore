@@ -4,6 +4,7 @@ frontend/dist/
 
 # Go / Backend
 backend/bin/
+backend/data/
 
 # OS / Environment
 .DS_Store
