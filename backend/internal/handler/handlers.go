@@ -17,7 +17,6 @@ import (
 	"SigTrap-backend/internal/store"
 )
 
-// Handler holds dependencies for all API handlers.
 type Handler struct {
 	config       *config.Config
 	store        *store.Store
@@ -26,7 +25,6 @@ type Handler struct {
 	aiEngine     ai.Engine
 }
 
-// NewHandler initializes a Handler with required services.
 func NewHandler(cfg *config.Config, st *store.Store, smMgr *sourcemap.Manager, pipe *ingest.Pipeline, aiEng ai.Engine) *Handler {
 	return &Handler{
 		config:       cfg,
@@ -37,8 +35,6 @@ func NewHandler(cfg *config.Config, st *store.Store, smMgr *sourcemap.Manager, p
 	}
 }
 
-// TrapHandler handles POST /api/v1/trap.
-// Ingests incoming client telemetry, validates payload, trims ring buffer, and queues for async processing.
 func (h *Handler) TrapHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		middleware.WriteJSONError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Only POST method is allowed.")
@@ -51,7 +47,7 @@ func (h *Handler) TrapHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20)) // 1MB payload limit
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil {
 		middleware.WriteJSONError(w, http.StatusBadRequest, "PAYLOAD_TOO_LARGE", "Request body exceeds maximum allowed size of 1MB.")
 		return
@@ -65,33 +61,27 @@ func (h *Handler) TrapHandler(w http.ResponseWriter, r *http.Request) {
 
 	event.ProjectKey = projectKey
 
-	// Validate payload structure & types
 	if err := event.Validate(); err != nil {
 		middleware.WriteJSONError(w, http.StatusBadRequest, "INVALID_PAYLOAD", err.Error())
 		return
 	}
 
-	// Enforce breadcrumb ring buffer cap (max 50)
 	event.EnforceRingBuffer(h.config.MaxBreadcrumbs)
 
-	// Non-blocking push into pipeline queue
 	if ok := h.pipeline.Enqueue(event); !ok {
 		middleware.WriteJSONError(w, http.StatusServiceUnavailable, "QUEUE_FULL", "Ingestion pipeline buffer is temporarily full.")
 		return
 	}
 
-	// Contract: return 202 Accepted immediately with empty body
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// UploadSourceMapHandler handles POST /api/v1/artifacts/sourcemaps.
 func (h *Handler) UploadSourceMapHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		middleware.WriteJSONError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Only POST method is allowed.")
 		return
 	}
 
-	// Parse multipart/form-data with max 32MB file limit
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		middleware.WriteJSONError(w, http.StatusBadRequest, "INVALID_MULTIPART", "Failed to parse multipart form: "+err.Error())
 		return
@@ -105,7 +95,6 @@ func (h *Handler) UploadSourceMapHandler(w http.ResponseWriter, r *http.Request)
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		// Fallback check for "sourcemap" parameter name
 		file, header, err = r.FormFile("sourcemap")
 	}
 	if err != nil {
@@ -138,7 +127,6 @@ func (h *Handler) UploadSourceMapHandler(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// ListSourceMapsHandler handles GET /api/v1/artifacts/sourcemaps.
 func (h *Handler) ListSourceMapsHandler(w http.ResponseWriter, r *http.Request) {
 	relVersion := r.URL.Query().Get("release_version")
 	maps := h.sourcemapMgr.ListSourceMaps(relVersion)
@@ -149,7 +137,6 @@ func (h *Handler) ListSourceMapsHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// ListIssuesHandler handles GET /api/v1/issues.
 func (h *Handler) ListIssuesHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		middleware.WriteJSONError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Only GET method is allowed.")
@@ -196,7 +183,6 @@ func (h *Handler) ListIssuesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// IssueDetailOrDiagnosticHandler routes GET / PATCH on /api/v1/issues/:issue_id and /api/v1/issues/:issue_id/diagnostic.
 func (h *Handler) IssueRouter(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/v1/issues/")
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -208,7 +194,6 @@ func (h *Handler) IssueRouter(w http.ResponseWriter, r *http.Request) {
 
 	issueID := parts[0]
 
-	// GET /api/v1/issues/:issue_id/diagnostic
 	if len(parts) >= 2 && parts[1] == "diagnostic" {
 		if len(parts) == 3 && parts[2] == "reanalyze" && r.Method == http.MethodPost {
 			h.ReanalyzeDiagnosticHandler(w, r, issueID)
@@ -220,13 +205,11 @@ func (h *Handler) IssueRouter(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// PATCH /api/v1/issues/:issue_id
 	if r.Method == http.MethodPatch {
 		h.UpdateIssueStatusHandler(w, r, issueID)
 		return
 	}
 
-	// GET /api/v1/issues/:issue_id
 	if r.Method == http.MethodGet {
 		h.GetIssueSummaryHandler(w, r, issueID)
 		return
@@ -283,10 +266,8 @@ func (h *Handler) GetIssueDiagnosticHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Resolve unminified stacktrace with code context
 	unminifiedFrames := h.sourcemapMgr.UnminifyStacktrace(latestEvent.ReleaseVersion, latestEvent.Exception.Stacktrace)
 
-	// Fetch or generate AI analysis
 	diag, ok := h.store.GetDiagnostic(issueID)
 	if !ok {
 		diag, _ = h.aiEngine.Analyze(latestEvent, unminifiedFrames)
@@ -337,7 +318,6 @@ func (h *Handler) ReanalyzeDiagnosticHandler(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// HealthHandler handles GET /api/v1/health.
 func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	metrics := h.store.GetMetrics()
 	pipelineStats := h.pipeline.Stats()

@@ -14,7 +14,6 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// ErrorResponse defines the standardized error JSON output structure.
 type ErrorDetail struct {
 	Field string `json:"field,omitempty"`
 	Issue string `json:"issue"`
@@ -30,7 +29,6 @@ type ErrorResponse struct {
 	Error ErrorBody `json:"error"`
 }
 
-// WriteJSONError sends a structured JSON error response.
 func WriteJSONError(w http.ResponseWriter, statusCode int, code, message string, details ...ErrorDetail) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
@@ -43,7 +41,6 @@ func WriteJSONError(w http.ResponseWriter, statusCode int, code, message string,
 	})
 }
 
-// CORS middleware adds cross-origin resource sharing headers and handles OPTIONS preflight.
 func CORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -60,7 +57,6 @@ func CORS(next http.Handler) http.Handler {
 	})
 }
 
-// ProjectKeyLimiter manages rate limiters per project key.
 type ProjectKeyLimiter struct {
 	limiters map[string]*rate.Limiter
 	mu       sync.RWMutex
@@ -68,7 +64,6 @@ type ProjectKeyLimiter struct {
 	burst    int
 }
 
-// NewProjectKeyLimiter initializes a rate limiter manager.
 func NewProjectKeyLimiter(rps float64, burst int) *ProjectKeyLimiter {
 	return &ProjectKeyLimiter{
 		limiters: make(map[string]*rate.Limiter),
@@ -89,7 +84,6 @@ func (pkl *ProjectKeyLimiter) getLimiter(projectKey string) *rate.Limiter {
 	pkl.mu.Lock()
 	defer pkl.mu.Unlock()
 
-	// Double check after lock
 	if limiter, exists = pkl.limiters[projectKey]; exists {
 		return limiter
 	}
@@ -99,7 +93,6 @@ func (pkl *ProjectKeyLimiter) getLimiter(projectKey string) *rate.Limiter {
 	return limiter
 }
 
-// RateLimit middleware enforces rate limits per project key.
 func (pkl *ProjectKeyLimiter) RateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		projectKey := r.Header.Get("X-SigTrap-Project-Key")
@@ -125,7 +118,6 @@ func (pkl *ProjectKeyLimiter) RateLimit(next http.Handler) http.Handler {
 	})
 }
 
-// RequireProjectKey middleware ensures X-SigTrap-Project-Key header is present on requests.
 func RequireProjectKey(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		projectKey := r.Header.Get("X-SigTrap-Project-Key")
@@ -138,7 +130,6 @@ func RequireProjectKey(next http.Handler) http.Handler {
 	})
 }
 
-// RequireAdminToken middleware verifies Bearer token against cfg.AdminToken.
 func RequireAdminToken(cfg *config.Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -167,22 +158,20 @@ func RequireAdminToken(cfg *config.Config) func(http.Handler) http.Handler {
 	}
 }
 
-// Logger middleware logs incoming HTTP request details.
 func Logger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rw := &responseWriterWrapper{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rw, r)
-		log.Printf("[HTTP] %s %s %d - %v", r.Method, r.URL.Path, rw.statusCode, time.Since(start))
+		log.Printf("%s %s %d %v", r.Method, r.URL.Path, rw.statusCode, time.Since(start))
 	})
 }
 
-// Recovery middleware handles panics safely.
 func Recovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
-				log.Printf("[PANIC RECOVERY] %v", err)
+				log.Printf("panic: %v", err)
 				WriteJSONError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR",
 					"An unexpected internal error occurred.")
 			}

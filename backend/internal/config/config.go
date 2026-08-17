@@ -5,7 +5,6 @@ import (
 	"strconv"
 )
 
-// Config holds the application configuration parameters.
 type Config struct {
 	Port           string
 	AdminToken     string
@@ -17,7 +16,6 @@ type Config struct {
 	GeminiAPIKey   string
 }
 
-// LoadConfig reads configuration from environment variables with sensible defaults.
 func LoadConfig() *Config {
 	return &Config{
 		Port:           getEnv("PORT", "8080"),

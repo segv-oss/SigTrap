@@ -15,21 +15,17 @@ func main() {
 	projectKey := "123e4567-e89b-12d3-a456-426614174000"
 	adminToken := "dev_admin_secret_123"
 
-	fmt.Println("==================================================================")
-	fmt.Println("⚡ SIGTRAP Live Backend Telemetry & Diagnostic Demo")
-	fmt.Println("==================================================================")
-
-	// 1. Health Check
+	// 1. Health check
 	resp, err := http.Get(baseURL + "/api/v1/health")
 	if err != nil {
-		fmt.Printf("❌ Health check failed: %v (is server running?)\n", err)
+		fmt.Printf("health check failed: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	fmt.Printf("1. Health Check Response (%d):\n%s\n\n", resp.StatusCode, string(body))
+	fmt.Printf("Health Check (%d):\n%s\n\n", resp.StatusCode, string(body))
 
-	// 2. Upload Source Map
+	// 2. Upload sourcemap
 	sourceMapContent := `{
 		"version": 3,
 		"file": "main.min.js",
@@ -54,14 +50,14 @@ func main() {
 
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
-		fmt.Printf("❌ Source map upload failed: %v\n", err)
+		fmt.Printf("sourcemap upload failed: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 	body, _ = io.ReadAll(resp.Body)
-	fmt.Printf("2. Source Map Upload Response (%d):\n%s\n\n", resp.StatusCode, string(body))
+	fmt.Printf("Source Map Upload (%d):\n%s\n\n", resp.StatusCode, string(body))
 
-	// 3. Post Telemetry Crash Trap
+	// 3. Post telemetry payload
 	trapPayload := map[string]interface{}{
 		"event_id":        "123e4567-e89b-12d3-a456-426614174000",
 		"timestamp":       time.Now().UnixMilli(),
@@ -118,24 +114,23 @@ func main() {
 
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
-		fmt.Printf("❌ Trap ingestion failed: %v\n", err)
+		fmt.Printf("trap ingestion failed: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
-	fmt.Printf("3. Ingestion POST /api/v1/trap Response Status: %d Accepted (Immediate Response)\n\n", resp.StatusCode)
+	fmt.Printf("Ingestion Status: %d\n\n", resp.StatusCode)
 
-	// Wait 200ms for async worker pool to process event & AI diagnosis
 	time.Sleep(300 * time.Millisecond)
 
-	// 4. Query Cockpit Issues
+	// 4. Query issues
 	resp, err = http.Get(baseURL + "/api/v1/issues?env=production")
 	if err != nil {
-		fmt.Printf("❌ Query issues failed: %v\n", err)
+		fmt.Printf("query issues failed: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 	body, _ = io.ReadAll(resp.Body)
-	fmt.Printf("4. Aggregated Issues Response (%d):\n%s\n\n", resp.StatusCode, string(body))
+	fmt.Printf("Issues (%d):\n%s\n\n", resp.StatusCode, string(body))
 
 	var issuesList struct {
 		Issues []struct {
@@ -147,10 +142,10 @@ func main() {
 	if len(issuesList.Issues) > 0 {
 		issueID := issuesList.Issues[0].IssueID
 
-		// 5. Query AI Root Cause Diagnostic
+		// 5. Query diagnostic
 		resp, err = http.Get(fmt.Sprintf("%s/api/v1/issues/%s/diagnostic", baseURL, issueID))
 		if err != nil {
-			fmt.Printf("❌ Diagnostic query failed: %v\n", err)
+			fmt.Printf("diagnostic query failed: %v\n", err)
 			return
 		}
 		defer resp.Body.Close()
@@ -158,10 +153,6 @@ func main() {
 
 		var prettyJSON bytes.Buffer
 		_ = json.Indent(&prettyJSON, body, "", "  ")
-		fmt.Printf("5. AI Diagnostic & Unminified Stacktrace Response (%d):\n%s\n\n", resp.StatusCode, prettyJSON.String())
+		fmt.Printf("Diagnostic (%d):\n%s\n\n", resp.StatusCode, prettyJSON.String())
 	}
-
-	fmt.Println("==================================================================")
-	fmt.Println("✅ SIGTRAP Backend Verification Complete!")
-	fmt.Println("==================================================================")
 }

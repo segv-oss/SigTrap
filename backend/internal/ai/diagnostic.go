@@ -12,19 +12,16 @@ import (
 	"SigTrap-backend/internal/model"
 )
 
-// Engine defines the interface for generating root-cause analysis and code patches.
 type Engine interface {
 	Analyze(event *model.TrapEvent, unminifiedFrames []model.UnminifiedFrame) (model.AIAnalysis, error)
 }
 
-// CompositeEngine wraps primary (Gemini API) and fallback (Heuristic) engines.
 type CompositeEngine struct {
 	geminiKey string
 	client    *http.Client
 	fallback  *HeuristicEngine
 }
 
-// NewEngine creates a composite AI diagnostic engine.
 func NewEngine(geminiKey string) Engine {
 	return &CompositeEngine{
 		geminiKey: geminiKey,
@@ -40,7 +37,6 @@ func (ce *CompositeEngine) Analyze(event *model.TrapEvent, unminifiedFrames []mo
 			return analysis, nil
 		}
 	}
-	// Fallback to intelligent heuristic diagnostic engine
 	return ce.fallback.Analyze(event, unminifiedFrames)
 }
 
@@ -48,7 +44,7 @@ func (ce *CompositeEngine) analyzeWithGemini(event *model.TrapEvent, unminifiedF
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=%s", ce.geminiKey)
 
 	var promptBuffer bytes.Buffer
-	promptBuffer.WriteString("You are SIGTRAP's senior post-mortem debugging AI. Analyze this browser exception and generate a root cause summary and unified git diff patch.\n\n")
+	promptBuffer.WriteString("Analyze this exception and generate a root cause summary and unified git diff patch.\n\n")
 	promptBuffer.WriteString(fmt.Sprintf("Exception Type: %s\nException Value: %s\nEnvironment: %s\nURL: %s\n\n",
 		event.Exception.Type, event.Exception.Value, event.Environment, event.Context.URL))
 
@@ -68,7 +64,7 @@ func (ce *CompositeEngine) analyzeWithGemini(event *model.TrapEvent, unminifiedF
 		promptBuffer.WriteString(fmt.Sprintf("- [%s] %s: %s\n", b.Category, b.Message, fmt.Sprintf("%v", b.Data)))
 	}
 
-	promptBuffer.WriteString("\nReturn ONLY valid JSON matching this exact structure:\n")
+	promptBuffer.WriteString("\nReturn JSON matching structure:\n")
 	promptBuffer.WriteString(`{"root_cause_summary": "...", "suggested_patch": "diff\n...", "confidence_score": 0.95}`)
 
 	reqBody := map[string]interface{}{
@@ -131,7 +127,6 @@ func (ce *CompositeEngine) analyzeWithGemini(event *model.TrapEvent, unminifiedF
 	return analysis, nil
 }
 
-// HeuristicEngine provides deterministic AI post-mortem diagnosis and git diff patch generation.
 type HeuristicEngine struct{}
 
 func (he *HeuristicEngine) Analyze(event *model.TrapEvent, unminifiedFrames []model.UnminifiedFrame) (model.AIAnalysis, error) {

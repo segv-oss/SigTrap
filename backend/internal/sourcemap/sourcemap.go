@@ -12,7 +12,6 @@ import (
 	"SigTrap-backend/internal/model"
 )
 
-// RawSourceMap represents the v3 SourceMap JSON format.
 type RawSourceMap struct {
 	Version        int      `json:"version"`
 	File           string   `json:"file"`
@@ -22,7 +21,6 @@ type RawSourceMap struct {
 	Mappings       string   `json:"mappings"`
 }
 
-// DecodedMapping represents a decoded source map entry.
 type DecodedMapping struct {
 	GeneratedLine   int
 	GeneratedColumn int
@@ -32,15 +30,13 @@ type DecodedMapping struct {
 	Name            string
 }
 
-// Manager manages source map persistence, indexing, and stack frame un-minification.
 type Manager struct {
 	dataDir string
-	cache   map[string]*RawSourceMap // key: release_version + ":" + filename
+	cache   map[string]*RawSourceMap
 	meta    map[string][]model.SourceMapMeta
 	mu      sync.RWMutex
 }
 
-// NewManager initializes the source map manager.
 func NewManager(dataDir string) (*Manager, error) {
 	sourcemapDir := filepath.Join(dataDir, "sourcemaps")
 	if err := os.MkdirAll(sourcemapDir, 0755); err != nil {
@@ -84,7 +80,6 @@ func (m *Manager) loadExistingMeta() error {
 	return nil
 }
 
-// SaveSourceMap stores an uploaded source map payload associated with a release version.
 func (m *Manager) SaveSourceMap(releaseVersion, filename string, content []byte) (*model.SourceMapMeta, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -103,7 +98,6 @@ func (m *Manager) SaveSourceMap(releaseVersion, filename string, content []byte)
 	if err := json.Unmarshal(content, &sm); err == nil {
 		cacheKey := releaseVersion + ":" + filename
 		m.cache[cacheKey] = &sm
-		// Also store under base filename without .map extension if applicable
 		trimmedName := strings.TrimSuffix(filename, ".map")
 		m.cache[releaseVersion+":"+trimmedName] = &sm
 	}
@@ -115,7 +109,6 @@ func (m *Manager) SaveSourceMap(releaseVersion, filename string, content []byte)
 		UploadedAt:     time.Now().UnixMilli(),
 	}
 
-	// Update metadata list
 	existing := m.meta[releaseVersion]
 	updated := false
 	for i, item := range existing {
@@ -132,14 +125,12 @@ func (m *Manager) SaveSourceMap(releaseVersion, filename string, content []byte)
 	return &meta, nil
 }
 
-// ListSourceMaps returns uploaded source map artifacts for a release version.
 func (m *Manager) ListSourceMaps(releaseVersion string) []model.SourceMapMeta {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.meta[releaseVersion]
 }
 
-// GetSourceMap loads a source map for a given release and filename.
 func (m *Manager) GetSourceMap(releaseVersion, filename string) (*RawSourceMap, error) {
 	cacheKey := releaseVersion + ":" + filename
 	m.mu.RLock()
@@ -152,12 +143,10 @@ func (m *Manager) GetSourceMap(releaseVersion, filename string) (*RawSourceMap, 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Check again after acquiring write lock
 	if sm, ok := m.cache[cacheKey]; ok && sm != nil {
 		return sm, nil
 	}
 
-	// Try reading from file system
 	relDir := filepath.Join(m.dataDir, releaseVersion)
 	baseFilename := filepath.Base(filename)
 	possibleNames := []string{
@@ -181,14 +170,12 @@ func (m *Manager) GetSourceMap(releaseVersion, filename string) (*RawSourceMap, 
 	return nil, fmt.Errorf("source map not found for release %s and file %s", releaseVersion, filename)
 }
 
-// UnminifyStacktrace converts minified stack frames into unminified frames with code context snippets.
 func (m *Manager) UnminifyStacktrace(releaseVersion string, minifiedFrames []model.StackFrame) []model.UnminifiedFrame {
 	unminified := make([]model.UnminifiedFrame, len(minifiedFrames))
 
 	for i, frame := range minifiedFrames {
 		sm, err := m.GetSourceMap(releaseVersion, frame.Filename)
 		if err != nil || sm == nil {
-			// Fallback if source map is not available yet
 			unminified[i] = model.UnminifiedFrame{
 				Filename:    frame.Filename,
 				Function:    frame.Function,
@@ -199,7 +186,6 @@ func (m *Manager) UnminifyStacktrace(releaseVersion string, minifiedFrames []mod
 			continue
 		}
 
-		// Resolve mapping
 		origFile, origLine, origCol, origFunc, contextLines := m.resolveFrameMapping(sm, frame.Lineno, frame.Colno, frame.Function)
 
 		unminified[i] = model.UnminifiedFrame{
@@ -230,7 +216,6 @@ func (m *Manager) resolveFrameMapping(sm *RawSourceMap, line, col int, fallbackF
 	}
 
 	if bestMatch == nil || bestMatch.OriginalSource == "" {
-		// Fallback to first source if available
 		origSource := "src/index.js"
 		if len(sm.Sources) > 0 {
 			origSource = sm.Sources[0]
@@ -291,8 +276,6 @@ func extractContextFromSource(sm *RawSourceMap, sourcePath string, line int, rad
 	return lines[start:end]
 }
 
-// VLQ decoding logic for Source Map v3 format
-
 const vlqBaseShift = 5
 const vlqBase = 1 << vlqBaseShift
 const vlqBaseMask = vlqBase - 1
@@ -310,7 +293,6 @@ func init() {
 	}
 }
 
-// DecodeVLQMappings parses a Source Map v3 mappings string into decoded mapping entries.
 func DecodeVLQMappings(mappings string) []DecodedMapping {
 	var result []DecodedMapping
 
@@ -395,7 +377,6 @@ func decodeVLQSegment(seg string) ([]int, bool) {
 			shift += vlqBaseShift
 		}
 
-		// Decode sign bit
 		isNegative := (result & 1) == 1
 		value := result >> 1
 		if isNegative {
