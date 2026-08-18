@@ -201,7 +201,7 @@ func (m *Manager) UnminifyStacktrace(releaseVersion string, minifiedFrames []mod
 }
 
 func (m *Manager) resolveFrameMapping(sm *RawSourceMap, line, col int, fallbackFunc string) (string, int, int, string, []string) {
-	mappings := DecodeVLQMappings(sm.Mappings)
+	mappings := DecodeVLQMappings(sm, sm.Mappings)
 
 	var bestMatch *DecodedMapping
 	for i := range mappings {
@@ -293,7 +293,7 @@ func init() {
 	}
 }
 
-func DecodeVLQMappings(mappings string) []DecodedMapping {
+func DecodeVLQMappings(sm *RawSourceMap, mappings string) []DecodedMapping {
 	var result []DecodedMapping
 
 	generatedLine := 1
@@ -333,13 +333,19 @@ func DecodeVLQMappings(mappings string) []DecodedMapping {
 				originalLine += fields[2]
 				originalCol += fields[3]
 
-				mapping.OriginalSource = fmt.Sprintf("source_%d", sourcesIndex)
+				// Resolve the real source filename from the sources array
+				if sourcesIndex >= 0 && sourcesIndex < len(sm.Sources) {
+					mapping.OriginalSource = sm.Sources[sourcesIndex]
+				}
 				mapping.OriginalLine = originalLine
 				mapping.OriginalColumn = originalCol
 
 				if len(fields) >= 5 {
 					namesIndex += fields[4]
-					mapping.Name = fmt.Sprintf("name_%d", namesIndex)
+					// Resolve the real function name from the names array
+					if namesIndex >= 0 && namesIndex < len(sm.Names) {
+						mapping.Name = sm.Names[namesIndex]
+					}
 				}
 			}
 

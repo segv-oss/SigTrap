@@ -12,7 +12,7 @@ export interface Context {
 
 export interface StackFrame {
     filename: string;
-    function: string;
+    function?: string;
     lineno: number;
     colno: number;
 }
@@ -30,6 +30,16 @@ export interface Exception {
     stacktrace: StackFrame[];
 }
 
+export interface UserInfo {
+    id?: string;
+    email?: string;
+}
+
+export interface SDKInfo {
+    name?: string;
+    version?: string;
+}
+
 export interface TrapPayload {
     event_id: string;
     timestamp: number;
@@ -38,6 +48,8 @@ export interface TrapPayload {
     exception: Exception;
     breadcrumbs: Breadcrumb[];
     context: Context;
+    user?: UserInfo;
+    sdk?: SDKInfo;
 }
 
 export interface TrapIssue {

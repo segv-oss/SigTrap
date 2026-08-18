@@ -1,7 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { SigTrap } from './sdk/sigtrap';
 import './App.css';
 
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 interface Issue {
   issue_id: string;
   type: string;
@@ -11,7 +14,7 @@ interface Issue {
   users_affected: number;
   last_seen: number;
   first_seen: number;
-  status: string;
+  status: 'unresolved' | 'resolved' | 'ignored';
   release_version: string;
   project_id: string;
   environment: string;
@@ -19,7 +22,7 @@ interface Issue {
 
 interface StackFrame {
   filename: string;
-  function: string;
+  function?: string;
   lineno: number;
   colno: number;
   code_context?: string[];
@@ -52,51 +55,418 @@ interface DiagnosticResponse {
       browser: string;
       os: string;
       url: string;
-      viewport: {
-        width: number;
-        height: number;
-      };
+      viewport: { width: number; height: number };
     };
   };
 }
 
-const API_BASE = 'http://localhost:8080/api/v1';
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const API_BASE    = 'http://localhost:8080/api/v1';
 const PROJECT_KEY = '123e4567-e89b-12d3-a456-426614174000';
+const POLL_MS     = 4000;
 
+// ---------------------------------------------------------------------------
+// Utility helpers
+// ---------------------------------------------------------------------------
+function relativeTime(ms: number): string {
+  const diff = Date.now() - ms;
+  if (diff < 60_000)   return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  return new Date(ms).toLocaleDateString();
+}
+
+function breadcrumbCategoryClass(cat: string): string {
+  const map: Record<string, string> = {
+    'ui.click':      'breadcrumb-row__cat--ui\\.click',
+    'network.fetch': 'breadcrumb-row__cat--network\\.fetch',
+    'navigation':    'breadcrumb-row__cat--navigation',
+    'console.error': 'breadcrumb-row__cat--console\\.error',
+  };
+  return map[cat] ?? 'breadcrumb-row__cat--default';
+}
+
+// ---------------------------------------------------------------------------
+// Mini sparkline (pure SVG, no library)
+// ---------------------------------------------------------------------------
+function Sparkline({ issue }: { issue: Issue }) {
+  const W = 120, H = 20;
+
+  // Build 8 synthetic data points decaying backwards from event_count
+  const points: number[] = [];
+  let v = issue.event_count;
+  for (let i = 7; i >= 0; i--) {
+    points[i] = Math.max(1, Math.round(v));
+    v = v * (0.6 + Math.random() * 0.3);
+  }
+
+  const max = Math.max(...points, 1);
+  const coords = points.map((p, i) => {
+    const x = (i / (points.length - 1)) * W;
+    const y = H - (p / max) * (H - 2) - 1;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+
+  return (
+    <svg
+      className="sparkline"
+      width={W}
+      height={H}
+      viewBox={`0 0 ${W} ${H}`}
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <polyline
+        points={coords.join(' ')}
+        stroke="var(--red)"
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// IssueCard
+// ---------------------------------------------------------------------------
+interface IssueCardProps {
+  issue: Issue;
+  active: boolean;
+  onClick: () => void;
+}
+
+function IssueCard({ issue, active, onClick }: IssueCardProps) {
+  const statusClass =
+    issue.status === 'resolved'
+      ? 'issue-card__status--resolved'
+      : issue.status === 'ignored'
+      ? 'issue-card__status--ignored'
+      : 'issue-card__status--unresolved';
+
+  return (
+    <div
+      className={`issue-card${active ? ' issue-card--active' : ''}`}
+      onClick={onClick}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => e.key === 'Enter' && onClick()}
+    >
+      <div className="issue-card__header">
+        <span className="issue-card__type">{issue.type}</span>
+        <span className="issue-card__time">{relativeTime(issue.last_seen)}</span>
+      </div>
+      <div className="issue-card__message" title={issue.value}>{issue.value}</div>
+      <div className="issue-card__file" title={issue.culprit_file}>
+        {issue.culprit_file}
+      </div>
+      <div className="issue-card__meta">
+        <span>🔥 <b>{issue.event_count}</b></span>
+        <span>👤 <b>{issue.users_affected}</b></span>
+        <span className={`issue-card__status ${statusClass}`}>{issue.status}</span>
+      </div>
+      {issue.event_count > 1 && <Sparkline issue={issue} />}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// StackTraceViewer
+// ---------------------------------------------------------------------------
+function StackTraceViewer({ frames }: { frames: StackFrame[] }) {
+  if (!frames || frames.length === 0) {
+    return (
+      <p style={{ color: 'var(--text-faint)', fontSize: 12, padding: '8px 0' }}>
+        No stack frames available.
+      </p>
+    );
+  }
+
+  return (
+    <>
+      {frames.map((frame, idx) => (
+        <div key={idx} className="stack-frame">
+          <div className="stack-frame__header">
+            <span>
+              <span className="stack-frame__file">{frame.filename}</span>
+              {frame.function && (
+                <span className="stack-frame__fn"> in {frame.function}</span>
+              )}
+            </span>
+            <span className="stack-frame__loc">
+              L{frame.lineno}:{frame.colno}
+            </span>
+          </div>
+          {frame.code_context && frame.code_context.length > 0 && (
+            <div className="code-context">
+              {frame.code_context.map((line, lIdx) => {
+                const isHot = line.includes('.map') || line.includes('undefined');
+                return (
+                  <div
+                    key={lIdx}
+                    className={`code-line${isHot ? ' code-line--highlight' : ''}`}
+                  >
+                    <span className="code-line__num">{lIdx + 1}</span>
+                    <span className="code-line__text">{line}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      ))}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// BreadcrumbTimeline
+// ---------------------------------------------------------------------------
+function BreadcrumbTimeline({ breadcrumbs }: { breadcrumbs: Breadcrumb[] }) {
+  if (!breadcrumbs || breadcrumbs.length === 0) {
+    return (
+      <p style={{ color: 'var(--text-faint)', fontSize: 12, padding: '8px 0' }}>
+        No breadcrumbs captured.
+      </p>
+    );
+  }
+
+  return (
+    <>
+      {breadcrumbs.map((b, idx) => (
+        <div key={idx} className="breadcrumb-row">
+          <span className="breadcrumb-row__time">
+            {new Date(b.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+          </span>
+          <span className={`breadcrumb-row__cat ${breadcrumbCategoryClass(b.category)}`}>
+            {b.category}
+          </span>
+          <span className="breadcrumb-row__msg">{b.message}</span>
+          {b.data && Object.keys(b.data).length > 0 && (
+            <span className="breadcrumb-row__data">
+              {JSON.stringify(b.data)}
+            </span>
+          )}
+        </div>
+      ))}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// EnvironmentRegisters
+// ---------------------------------------------------------------------------
+function EnvironmentRegisters({ ctx }: { ctx: DiagnosticResponse['latest_event']['context'] }) {
+  const registers = [
+    { label: 'Browser', value: ctx.browser },
+    { label: 'OS',      value: ctx.os },
+    { label: 'Viewport', value: `${ctx.viewport.width} × ${ctx.viewport.height}` },
+    { label: 'Crash URL', value: ctx.url },
+  ];
+
+  return (
+    <div className="registers-grid">
+      {registers.map((r) => (
+        <div key={r.label} className="register">
+          <div className="register__label">{r.label}</div>
+          <div className="register__value" title={r.value}>{r.value}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DiagnosticPanel
+// ---------------------------------------------------------------------------
+interface DiagnosticPanelProps {
+  diagnostic: DiagnosticResponse;
+  loading: boolean;
+  onReanalyze: () => void;
+  onResolve: () => void;
+  onIgnore: () => void;
+}
+
+function DiagnosticPanel({
+  diagnostic,
+  loading,
+  onReanalyze,
+  onResolve,
+  onIgnore,
+}: DiagnosticPanelProps) {
+  const [copied, setCopied] = useState(false);
+
+  const copyPatch = () => {
+    navigator.clipboard.writeText(diagnostic.ai_analysis.suggested_patch);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const evt = diagnostic.latest_event;
+  const ai  = diagnostic.ai_analysis;
+
+  return (
+    <div className="panel__stack">
+
+      {/* Issue header */}
+      <div className="card card__body">
+        <div className="issue-header">
+          <div>
+            <div className="issue-header__meta">
+              <span className="issue-header__id">{diagnostic.issue_id}</span>
+              <span className="pill">{evt.environment}</span>
+              <span className="pill">{evt.release_version}</span>
+            </div>
+            <h2 className="issue-header__title">
+              {evt.unminified_stacktrace[0]?.filename ?? 'Crash Exception'}
+            </h2>
+          </div>
+          <div className="issue-header__actions">
+            <button
+              id="btn-reanalyze"
+              className="btn btn--ghost"
+              onClick={onReanalyze}
+              disabled={loading}
+            >
+              {loading ? <><span className="spinner" /> Analyzing…</> : '↻ Re-run AI'}
+            </button>
+            <button
+              id="btn-resolve"
+              className="btn btn--success"
+              onClick={onResolve}
+            >
+              ✓ Resolve
+            </button>
+            <button
+              id="btn-ignore"
+              className="btn btn--ghost"
+              onClick={onIgnore}
+            >
+              Ignore
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* AI Root-cause card */}
+      <div className="ai-card">
+        <div className="ai-card__header">
+          <div className="ai-card__label">
+            <span>🤖</span>
+            <span>AI Root-Cause Diagnosis</span>
+          </div>
+          <span className="confidence-badge">
+            {(ai.confidence_score * 100).toFixed(0)}% confidence
+          </span>
+        </div>
+        <div className="ai-card__body">
+          <p className="ai-card__summary">{ai.root_cause_summary}</p>
+          <div className="diff-block">
+            <div className="diff-block__toolbar">
+              <span className="diff-block__label">Suggested patch</span>
+              <button
+                id="btn-copy-patch"
+                className="btn btn--ghost btn--sm"
+                onClick={copyPatch}
+              >
+                {copied ? '✓ Copied' : '⎘ Copy diff'}
+              </button>
+            </div>
+            <pre className="diff-block__pre">{ai.suggested_patch}</pre>
+          </div>
+        </div>
+      </div>
+
+      {/* Stack trace */}
+      <div className="card">
+        <div className="card__header">
+          <span className="card__title">
+            <span>{'</>'}</span> Unminified Stack Trace
+          </span>
+          <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+            {evt.unminified_stacktrace.length} frames
+          </span>
+        </div>
+        <div className="card__body">
+          <StackTraceViewer frames={evt.unminified_stacktrace} />
+        </div>
+      </div>
+
+      {/* Breadcrumb replay */}
+      <div className="card">
+        <div className="card__header">
+          <span className="card__title">
+            <span>⏱</span> Breadcrumb Ring Buffer Replay
+          </span>
+          <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+            {evt.breadcrumbs.length} / 50 events
+          </span>
+        </div>
+        <div className="card__body">
+          <BreadcrumbTimeline breadcrumbs={evt.breadcrumbs} />
+        </div>
+      </div>
+
+      {/* Environment registers */}
+      <div className="card">
+        <div className="card__header">
+          <span className="card__title">
+            <span>🌐</span> Runtime Environment
+          </span>
+        </div>
+        <div className="card__body">
+          <EnvironmentRegisters ctx={evt.context} />
+        </div>
+      </div>
+
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// App (root)
+// ---------------------------------------------------------------------------
 export function App() {
-  const [issues, setIssues] = useState<Issue[]>([]);
-  const [selectedIssueID, setSelectedIssueID] = useState<string | null>(null);
-  const [diagnostic, setDiagnostic] = useState<DiagnosticResponse | null>(null);
-  const [loadingIssues, setLoadingIssues] = useState<boolean>(true);
-  const [loadingDiagnostic, setLoadingDiagnostic] = useState<boolean>(false);
-  const [statusFilter, setStatusFilter] = useState<string>('unresolved');
-  const [envFilter, setEnvFilter] = useState<string>('production');
-  const [searchQuery, setSearchQuery] = useState<string>('');
-  const [copiedPatch, setCopiedPatch] = useState<boolean>(false);
-  const [backendOnline, setBackendOnline] = useState<boolean>(true);
+  const [issues, setIssues]               = useState<Issue[]>([]);
+  const [selectedID, setSelectedID]       = useState<string | null>(null);
+  const [diagnostic, setDiagnostic]       = useState<DiagnosticResponse | null>(null);
+  const [loadingIssues, setLoadingIssues] = useState(true);
+  const [loadingDiag, setLoadingDiag]     = useState(false);
+  const [statusFilter, setStatusFilter]   = useState<string>('unresolved');
+  const [envFilter, setEnvFilter]         = useState<string>('production');
+  const [search, setSearch]               = useState<string>('');
+  const [backendOnline, setBackendOnline] = useState(true);
 
-  // Initialize SigTrap SDK on load
+  // Init SDK
   useEffect(() => {
     SigTrap.init({
-      projectKey: PROJECT_KEY,
-      endpoint: `${API_BASE}/trap`,
-      environment: 'production',
+      projectKey:     PROJECT_KEY,
+      endpoint:       `${API_BASE}/trap`,
+      environment:    'production',
       releaseVersion: 'v1.4.2-ab89c2',
     });
   }, []);
 
-  // Fetch Issues List
-  const fetchIssues = async () => {
+  // Fetch issues (with polling)
+  const fetchIssues = useCallback(async () => {
     setLoadingIssues(true);
     try {
-      const url = `${API_BASE}/issues?project_id=${PROJECT_KEY}&env=${envFilter}&status=${statusFilter}&search=${encodeURIComponent(searchQuery)}`;
-      const res = await fetch(url);
+      const params = new URLSearchParams({
+        project_id: PROJECT_KEY,
+        env:        envFilter,
+        status:     statusFilter,
+        search:     search,
+      });
+      const res = await fetch(`${API_BASE}/issues?${params}`);
       if (res.ok) {
         const data = await res.json();
-        setIssues(data.issues || []);
+        const list: Issue[] = data.issues ?? [];
+        setIssues(list);
         setBackendOnline(true);
-        if (data.issues && data.issues.length > 0 && !selectedIssueID) {
-          setSelectedIssueID(data.issues[0].issue_id);
+        if (list.length > 0 && !selectedID) {
+          setSelectedID(list[0].issue_id);
         }
       } else {
         setBackendOnline(false);
@@ -106,410 +476,188 @@ export function App() {
     } finally {
       setLoadingIssues(false);
     }
-  };
+  }, [envFilter, statusFilter, search, selectedID]);
 
   useEffect(() => {
     fetchIssues();
-    const interval = setInterval(fetchIssues, 4000); // Polling every 4s
-    return () => clearInterval(interval);
-  }, [statusFilter, envFilter, searchQuery]);
+    const id = setInterval(fetchIssues, POLL_MS);
+    return () => clearInterval(id);
+  }, [fetchIssues]);
 
-  // Fetch Issue Diagnostic Details
+  // Fetch diagnostic when issue selected
   useEffect(() => {
-    if (!selectedIssueID) return;
+    if (!selectedID) return;
+    setLoadingDiag(true);
+    fetch(`${API_BASE}/issues/${selectedID}/diagnostic`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => { if (data) setDiagnostic(data); })
+      .catch(console.error)
+      .finally(() => setLoadingDiag(false));
+  }, [selectedID]);
 
-    const fetchDiagnostic = async () => {
-      setLoadingDiagnostic(true);
-      try {
-        const res = await fetch(`${API_BASE}/issues/${selectedIssueID}/diagnostic`);
-        if (res.ok) {
-          const data = await res.json();
-          setDiagnostic(data);
-        }
-      } catch (err) {
-        console.error('Failed to fetch diagnostic:', err);
-      } finally {
-        setLoadingDiagnostic(false);
-      }
-    };
-
-    fetchDiagnostic();
-  }, [selectedIssueID]);
-
-  // Update Issue Status (Resolve / Ignore)
-  const updateStatus = async (issueID: string, newStatus: string) => {
-    try {
-      const res = await fetch(`${API_BASE}/issues/${issueID}`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-SigTrap-Project-Key': PROJECT_KEY,
-        },
-        body: JSON.stringify({ status: newStatus }),
-      });
-      if (res.ok) {
-        fetchIssues();
-      }
-    } catch (err) {
-      console.error('Failed to update issue status:', err);
-    }
-  };
-
-  // Trigger Fresh AI Diagnostic Reanalysis
-  const triggerReanalyze = async (issueID: string) => {
-    setLoadingDiagnostic(true);
-    try {
-      const res = await fetch(`${API_BASE}/issues/${issueID}/diagnostic/reanalyze`, {
-        method: 'POST',
-      });
-      if (res.ok) {
-        const resDiag = await fetch(`${API_BASE}/issues/${issueID}/diagnostic`);
-        if (resDiag.ok) {
-          const data = await resDiag.json();
-          setDiagnostic(data);
-        }
-      }
-    } catch (err) {
-      console.error('Reanalyze failed:', err);
-    } finally {
-      setLoadingDiagnostic(false);
-    }
-  };
-
-  // Simulate a live client-side crash to test telemetry ingestion
-  const simulateLiveCrash = async () => {
-    SigTrap.addBreadcrumb({
-      category: 'ui.click',
-      message: 'button#checkout-submit.btn-primary',
+  const updateStatus = async (id: string, status: string) => {
+    await fetch(`${API_BASE}/issues/${id}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-SigTrap-Project-Key': PROJECT_KEY,
+      },
+      body: JSON.stringify({ status }),
     });
+    fetchIssues();
+  };
+
+  const triggerReanalyze = async () => {
+    if (!selectedID) return;
+    setLoadingDiag(true);
+    try {
+      await fetch(`${API_BASE}/issues/${selectedID}/diagnostic/reanalyze`, { method: 'POST' });
+      const r = await fetch(`${API_BASE}/issues/${selectedID}/diagnostic`);
+      if (r.ok) setDiagnostic(await r.json());
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoadingDiag(false);
+    }
+  };
+
+  const simulateCrash = () => {
+    SigTrap.addBreadcrumb({ category: 'ui.click', message: 'button#fire-test-trap' });
     SigTrap.addBreadcrumb({
       category: 'network.fetch',
       message: 'POST /api/checkout',
-      data: { status_code: 500, latency_ms: 180 },
+      data: { status_code: 500, latency_ms: 210 },
     });
-
-    // Fire simulated TypeError crash
-    const fakeError = new TypeError("Cannot read properties of undefined (reading 'map')");
-    fakeError.stack = "TypeError: Cannot read properties of undefined (reading 'map')\n    at renderList (https://segv.tech/assets/main.min.js:1:4892)";
-    
-    SigTrap.captureException(fakeError, 'TypeError');
-
-    setTimeout(() => {
-      fetchIssues();
-    }, 500);
-  };
-
-  const copyPatchToClipboard = (patchText: string) => {
-    navigator.clipboard.writeText(patchText);
-    setCopiedPatch(true);
-    setTimeout(() => setCopiedPatch(false), 2000);
+    const err = new TypeError("Cannot read properties of undefined (reading 'map')");
+    err.stack = [
+      "TypeError: Cannot read properties of undefined (reading 'map')",
+      '    at renderList (https://segv.tech/assets/main.min.js:1:4892)',
+      '    at App (https://segv.tech/assets/main.min.js:1:1200)',
+    ].join('\n');
+    SigTrap.captureException(err, 'TypeError');
+    setTimeout(fetchIssues, 600);
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', backgroundColor: '#0a0c10', color: '#e6edf3', fontFamily: 'Inter, sans-serif' }}>
-      
-      {/* ⚡ TOP NAVIGATION HEADER */}
-      <header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 24px', backgroundColor: '#0d1017', borderBottom: '1px solid #21283b' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <span style={{ fontSize: '24px' }}>⚡</span>
+    <div className="app-shell">
+      {/* ── Top navigation ─────────────────────────────────────────────── */}
+      <header className="topnav">
+        <div className="topnav__brand">
+          <span className="topnav__logo">⚡</span>
           <div>
-            <h1 style={{ margin: 0, fontSize: '18px', fontWeight: 800, letterSpacing: '0.5px', color: '#ffffff' }}>
-              SIGTRAP <span style={{ fontSize: '11px', fontWeight: 600, padding: '2px 8px', borderRadius: '12px', backgroundColor: 'rgba(0, 240, 255, 0.15)', color: '#00f0ff', border: '1px solid rgba(0,240,255,0.3)', marginLeft: '8px' }}>v1.1 COCKPIT</span>
-            </h1>
-            <p style={{ margin: 0, fontSize: '11px', color: '#8b949e' }}>Catch the signal. Replay the state. Patch the root cause.</p>
+            <div style={{ display: 'flex', alignItems: 'center' }}>
+              <span className="topnav__title">SIGTRAP</span>
+              <span className="topnav__badge">v1.1 COCKPIT</span>
+            </div>
+            <div className="topnav__subtitle">
+              Catch the signal. Replay the state. Patch the root cause.
+            </div>
           </div>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-          {/* Status Indicator */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: backendOnline ? '#2ea043' : '#f85149' }}>
-            <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: backendOnline ? '#2ea043' : '#f85149', display: 'inline-block' }}></span>
-            {backendOnline ? 'Backend Online (Port 8080)' : 'Backend Disconnected'}
+        <div className="topnav__controls">
+          <div className={`status-dot status-dot--${backendOnline ? 'online' : 'offline'}`}>
+            <span className="status-dot__indicator" />
+            {backendOnline ? 'Backend online' : 'Backend offline'}
           </div>
 
-          {/* Environment Switcher */}
-          <select 
-            value={envFilter} 
+          <select
+            id="env-select"
+            className="select"
+            value={envFilter}
             onChange={(e) => setEnvFilter(e.target.value)}
-            style={{ backgroundColor: '#12161f', color: '#e6edf3', border: '1px solid #21283b', borderRadius: '6px', padding: '6px 12px', fontSize: '12px' }}
           >
-            <option value="production">Env: production</option>
-            <option value="staging">Env: staging</option>
-            <option value="all">Env: all</option>
+            <option value="production">production</option>
+            <option value="staging">staging</option>
+            <option value="all">all envs</option>
           </select>
 
-          {/* Trigger Crash Test Button */}
           <button
-            onClick={simulateLiveCrash}
-            className="btn-interactive"
-            style={{ backgroundColor: '#f85149', color: '#ffffff', border: 'none', borderRadius: '6px', padding: '6px 14px', fontSize: '12px', fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
+            id="btn-fire-test-trap"
+            className="btn btn--danger"
+            onClick={simulateCrash}
           >
             💥 Fire Test Trap
           </button>
         </div>
       </header>
 
-      {/* 🚀 MAIN DASHBOARD CONTENT AREA */}
-      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+      {/* ── Body ───────────────────────────────────────────────────────── */}
+      <div className="app-body">
 
-        {/* 📋 LEFT SIDEBAR: AGGREGATED ISSUES LIST */}
-        <div style={{ width: '380px', backgroundColor: '#0d1017', borderRight: '1px solid #21283b', display: 'flex', flexDirection: 'column' }}>
-          
-          {/* Filter Bar */}
-          <div style={{ padding: '16px', borderBottom: '1px solid #21283b', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+        {/* Sidebar */}
+        <aside className="sidebar">
+          <div className="sidebar__filters">
             <input
+              id="search-input"
+              className="input"
               type="text"
-              placeholder="Search issues by exception, message, file..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              style={{ backgroundColor: '#12161f', color: '#e6edf3', border: '1px solid #21283b', borderRadius: '6px', padding: '8px 12px', fontSize: '12px', width: '100%', boxSizing: 'border-box' }}
+              placeholder="Search by exception, message, file…"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
             />
-            <div style={{ display: 'flex', gap: '4px', backgroundColor: '#12161f', padding: '3px', borderRadius: '6px', border: '1px solid #21283b' }}>
-              {['unresolved', 'resolved', 'ignored', 'all'].map((st) => (
+            <div className="sidebar__tabs">
+              {(['unresolved', 'resolved', 'ignored', 'all'] as const).map((s) => (
                 <button
-                  key={st}
-                  onClick={() => setStatusFilter(st)}
-                  style={{
-                    flex: 1,
-                    padding: '4px 0',
-                    fontSize: '11px',
-                    fontWeight: 600,
-                    borderRadius: '4px',
-                    border: 'none',
-                    backgroundColor: statusFilter === st ? '#21283b' : 'transparent',
-                    color: statusFilter === st ? '#00f0ff' : '#8b949e',
-                    cursor: 'pointer',
-                    textTransform: 'capitalize',
-                  }}
+                  key={s}
+                  id={`tab-${s}`}
+                  className={`sidebar__tab${statusFilter === s ? ' sidebar__tab--active' : ''}`}
+                  onClick={() => setStatusFilter(s)}
                 >
-                  {st}
+                  {s}
                 </button>
               ))}
             </div>
           </div>
 
-          {/* Issues Scroll Area */}
-          <div style={{ flex: 1, overflowY: 'auto', padding: '8px' }}>
+          <div className="sidebar__list">
             {loadingIssues && issues.length === 0 ? (
-              <div style={{ padding: '32px', textAlign: 'center', color: '#8b949e', fontSize: '13px' }}>Loading issues...</div>
+              <div className="sidebar__empty">
+                <span className="spinner" style={{ margin: '0 auto 8px' }} />
+                Loading issues…
+              </div>
             ) : issues.length === 0 ? (
-              <div style={{ padding: '32px', textAlign: 'center', color: '#8b949e', fontSize: '13px' }}>
-                No issues found matching criteria. Click <b>"Fire Test Trap"</b> to capture a live crash!
+              <div className="sidebar__empty">
+                No issues found.<br />
+                Click <strong>Fire Test Trap</strong> to capture a live crash.
               </div>
             ) : (
-              issues.map((issue) => {
-                const isSelected = issue.issue_id === selectedIssueID;
-                return (
-                  <div
-                    key={issue.issue_id}
-                    onClick={() => setSelectedIssueID(issue.issue_id)}
-                    className="card-glow"
-                    style={{
-                      padding: '12px',
-                      borderRadius: '8px',
-                      backgroundColor: isSelected ? '#181e2b' : '#12161f',
-                      border: isSelected ? '1px solid #00f0ff' : '1px solid #21283b',
-                      marginBottom: '8px',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
-                      <span style={{ fontSize: '11px', fontWeight: 700, padding: '2px 6px', borderRadius: '4px', backgroundColor: 'rgba(248, 81, 73, 0.15)', color: '#f85149', fontFamily: 'JetBrains Mono, monospace' }}>
-                        {issue.type}
-                      </span>
-                      <span style={{ fontSize: '11px', color: '#8b949e' }}>
-                        {new Date(issue.last_seen).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                      </span>
-                    </div>
-
-                    <div style={{ fontSize: '13px', fontWeight: 600, color: '#e6edf3', marginBottom: '6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      {issue.value}
-                    </div>
-
-                    <div style={{ fontSize: '11px', color: '#00f0ff', fontFamily: 'JetBrains Mono, monospace', marginBottom: '8px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      📍 {issue.culprit_file}
-                    </div>
-
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', fontSize: '11px', color: '#8b949e' }}>
-                      <span>🔥 <b>{issue.event_count}</b> events</span>
-                      <span>👤 <b>{issue.users_affected}</b> user</span>
-                      <span style={{ marginLeft: 'auto', textTransform: 'capitalize', color: issue.status === 'resolved' ? '#2ea043' : '#d29922' }}>
-                        ● {issue.status}
-                      </span>
-                    </div>
-                  </div>
-                );
-              })
+              issues.map((issue) => (
+                <IssueCard
+                  key={issue.issue_id}
+                  issue={issue}
+                  active={issue.issue_id === selectedID}
+                  onClick={() => {
+                    setSelectedID(issue.issue_id);
+                    setDiagnostic(null);
+                  }}
+                />
+              ))
             )}
           </div>
-        </div>
+        </aside>
 
-        {/* 🔬 RIGHT PANEL: POST-MORTEM DIAGNOSTIC & STACKTRACE REPLAY */}
-        <div style={{ flex: 1, backgroundColor: '#0a0c10', display: 'flex', flexDirection: 'column', overflowY: 'auto', padding: '24px' }}>
-          {loadingDiagnostic ? (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#00f0ff', fontSize: '14px' }}>
-              ⚡ Running AI Root-Cause Diagnostic Analysis...
+        {/* Main panel */}
+        <main className="panel">
+          {loadingDiag ? (
+            <div className="panel__loading">
+              <span className="spinner" />
+              Running AI root-cause diagnostic…
             </div>
           ) : !diagnostic ? (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#8b949e', fontSize: '14px' }}>
-              Select an issue from the list to inspect frame registers & AI patches.
+            <div className="panel__empty">
+              Select an issue to inspect the AI diagnosis & stack trace.
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-              
-              {/* ISSUE HEADER BAR */}
-              <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', backgroundColor: '#12161f', padding: '16px', borderRadius: '8px', border: '1px solid #21283b' }}>
-                <div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
-                    <span style={{ fontSize: '12px', color: '#8b949e', fontFamily: 'JetBrains Mono, monospace' }}>{diagnostic.issue_id}</span>
-                    <span style={{ fontSize: '11px', padding: '2px 8px', borderRadius: '12px', backgroundColor: '#21283b', color: '#e6edf3' }}>
-                      {diagnostic.latest_event.environment}
-                    </span>
-                    <span style={{ fontSize: '11px', padding: '2px 8px', borderRadius: '12px', backgroundColor: '#21283b', color: '#00f0ff', fontFamily: 'JetBrains Mono, monospace' }}>
-                      {diagnostic.latest_event.release_version}
-                    </span>
-                  </div>
-                  <h2 style={{ margin: 0, fontSize: '18px', color: '#ffffff', fontWeight: 700 }}>
-                    {diagnostic.latest_event.unminified_stacktrace[0]?.filename || 'Crash Exception'}
-                  </h2>
-                </div>
-
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <button
-                    onClick={() => triggerReanalyze(diagnostic.issue_id)}
-                    className="btn-interactive"
-                    style={{ backgroundColor: '#21283b', color: '#00f0ff', border: '1px solid rgba(0,240,255,0.3)', borderRadius: '6px', padding: '8px 14px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}
-                  >
-                    🤖 Re-run AI Diagnosis
-                  </button>
-                  <button
-                    onClick={() => updateStatus(diagnostic.issue_id, 'resolved')}
-                    className="btn-interactive"
-                    style={{ backgroundColor: '#2ea043', color: '#ffffff', border: 'none', borderRadius: '6px', padding: '8px 14px', fontSize: '12px', fontWeight: 700, cursor: 'pointer' }}
-                  >
-                    ✓ Resolve Issue
-                  </button>
-                  <button
-                    onClick={() => updateStatus(diagnostic.issue_id, 'ignored')}
-                    className="btn-interactive"
-                    style={{ backgroundColor: '#21283b', color: '#8b949e', border: 'none', borderRadius: '6px', padding: '8px 14px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}
-                  >
-                    Ignore
-                  </button>
-                </div>
-              </div>
-
-              {/* 🤖 AI ROOT CAUSE DIAGNOSTIC CARD */}
-              <div style={{ backgroundColor: '#12161f', borderRadius: '8px', border: '1px solid rgba(0, 240, 255, 0.4)', padding: '20px', boxShadow: '0 0 20px rgba(0, 240, 255, 0.05)' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <span style={{ fontSize: '18px' }}>🤖</span>
-                    <h3 style={{ margin: 0, fontSize: '15px', color: '#00f0ff', fontWeight: 700 }}>AI Root-Cause Diagnosis</h3>
-                  </div>
-                  <span style={{ fontSize: '11px', fontWeight: 700, padding: '3px 10px', borderRadius: '12px', backgroundColor: 'rgba(46, 160, 67, 0.15)', color: '#2ea043', border: '1px solid rgba(46, 160, 67, 0.3)' }}>
-                    Confidence Score: {(diagnostic.ai_analysis.confidence_score * 100).toFixed(0)}%
-                  </span>
-                </div>
-
-                <p style={{ margin: '0 0 16px 0', fontSize: '13px', lineHeight: '1.6', color: '#e6edf3' }}>
-                  {diagnostic.ai_analysis.root_cause_summary}
-                </p>
-
-                {/* SUGGESTED PATCH DIFF BOX */}
-                <div style={{ backgroundColor: '#0d1017', borderRadius: '6px', border: '1px solid #21283b', overflow: 'hidden' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 14px', backgroundColor: '#181e2b', borderBottom: '1px solid #21283b', fontSize: '12px', fontWeight: 600, color: '#8b949e' }}>
-                    <span>Suggested Git Diff Patch</span>
-                    <button
-                      onClick={() => copyPatchToClipboard(diagnostic.ai_analysis.suggested_patch)}
-                      style={{ backgroundColor: '#21283b', color: '#00f0ff', border: 'none', borderRadius: '4px', padding: '4px 10px', fontSize: '11px', cursor: 'pointer' }}
-                    >
-                      {copiedPatch ? '✓ Copied Diff!' : '📋 Copy Patch'}
-                    </button>
-                  </div>
-                  <pre style={{ margin: 0, padding: '14px', fontSize: '12px', fontFamily: 'JetBrains Mono, monospace', color: '#2ea043', overflowX: 'auto' }}>
-                    {diagnostic.ai_analysis.suggested_patch}
-                  </pre>
-                </div>
-              </div>
-
-              {/* 📜 SOURCE-MAPPED STACK TRACE & CODE CONTEXT */}
-              <div style={{ backgroundColor: '#12161f', borderRadius: '8px', border: '1px solid #21283b', padding: '20px' }}>
-                <h3 style={{ margin: '0 0 16px 0', fontSize: '14px', color: '#ffffff', fontWeight: 700 }}>Unminified Stack Frame & Code Context</h3>
-                
-                {diagnostic.latest_event.unminified_stacktrace.map((frame, idx) => (
-                  <div key={idx} style={{ marginBottom: '16px', backgroundColor: '#0d1017', borderRadius: '6px', border: '1px solid #21283b', overflow: 'hidden' }}>
-                    <div style={{ padding: '10px 14px', backgroundColor: '#181e2b', borderBottom: '1px solid #21283b', fontSize: '12px', fontFamily: 'JetBrains Mono, monospace', color: '#00f0ff', display: 'flex', justifyContent: 'space-between' }}>
-                      <span>📄 <b>{frame.filename}</b> in <code>{frame.function || 'anonymous'}</code></span>
-                      <span style={{ color: '#8b949e' }}>Line {frame.lineno}:{frame.colno}</span>
-                    </div>
-
-                    {frame.code_context && frame.code_context.length > 0 && (
-                      <div style={{ padding: '12px', fontFamily: 'JetBrains Mono, monospace', fontSize: '12px', backgroundColor: '#0d1017' }}>
-                        {frame.code_context.map((line, lIdx) => (
-                          <div key={lIdx} style={{ display: 'flex', gap: '12px', color: line.includes('.map') ? '#f85149' : '#8b949e', backgroundColor: line.includes('.map') ? 'rgba(248, 81, 73, 0.1)' : 'transparent', padding: '2px 4px', borderRadius: '2px' }}>
-                            <span style={{ width: '24px', textAlign: 'right', color: '#57606a', userSelect: 'none' }}>{lIdx + 1}</span>
-                            <span style={{ color: line.includes('.map') ? '#f85149' : '#e6edf3' }}>{line}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-
-              {/* 📼 BREADCRUMB RING BUFFER REPLAY TIMELINE */}
-              <div style={{ backgroundColor: '#12161f', borderRadius: '8px', border: '1px solid #21283b', padding: '20px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-                  <h3 style={{ margin: 0, fontSize: '14px', color: '#ffffff', fontWeight: 700 }}>50-Event Breadcrumb Ring Buffer Replay</h3>
-                  <span style={{ fontSize: '11px', color: '#8b949e' }}>{diagnostic.latest_event.breadcrumbs.length} captured events</span>
-                </div>
-
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                  {diagnostic.latest_event.breadcrumbs.map((b, idx) => (
-                    <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '8px 12px', backgroundColor: '#0d1017', borderRadius: '6px', border: '1px solid #21283b', fontSize: '12px' }}>
-                      <span style={{ fontSize: '10px', fontFamily: 'JetBrains Mono, monospace', color: '#57606a' }}>
-                        {new Date(b.timestamp).toLocaleTimeString()}
-                      </span>
-                      <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 6px', borderRadius: '4px', backgroundColor: b.category === 'network.fetch' ? 'rgba(163, 113, 247, 0.15)' : 'rgba(0, 240, 255, 0.15)', color: b.category === 'network.fetch' ? '#a371f7' : '#00f0ff' }}>
-                        {b.category}
-                      </span>
-                      <span style={{ color: '#e6edf3', fontFamily: 'JetBrains Mono, monospace' }}>{b.message}</span>
-                      {b.data && (
-                        <span style={{ marginLeft: 'auto', fontSize: '11px', color: '#8b949e', fontFamily: 'JetBrains Mono, monospace' }}>
-                          {JSON.stringify(b.data)}
-                        </span>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* 🌐 RUNTIME ENVIRONMENT REGISTERS */}
-              <div style={{ backgroundColor: '#12161f', borderRadius: '8px', border: '1px solid #21283b', padding: '20px' }}>
-                <h3 style={{ margin: '0 0 12px 0', fontSize: '14px', color: '#ffffff', fontWeight: 700 }}>Runtime Environment & Context Registers</h3>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px', fontSize: '12px' }}>
-                  <div style={{ backgroundColor: '#0d1017', padding: '10px', borderRadius: '6px', border: '1px solid #21283b' }}>
-                    <div style={{ color: '#8b949e', fontSize: '10px', marginBottom: '4px' }}>BROWSER</div>
-                    <div style={{ fontWeight: 600, color: '#e6edf3' }}>{diagnostic.latest_event.context.browser}</div>
-                  </div>
-                  <div style={{ backgroundColor: '#0d1017', padding: '10px', borderRadius: '6px', border: '1px solid #21283b' }}>
-                    <div style={{ color: '#8b949e', fontSize: '10px', marginBottom: '4px' }}>OS</div>
-                    <div style={{ fontWeight: 600, color: '#e6edf3' }}>{diagnostic.latest_event.context.os}</div>
-                  </div>
-                  <div style={{ backgroundColor: '#0d1017', padding: '10px', borderRadius: '6px', border: '1px solid #21283b' }}>
-                    <div style={{ color: '#8b949e', fontSize: '10px', marginBottom: '4px' }}>VIEWPORT</div>
-                    <div style={{ fontWeight: 600, color: '#e6edf3' }}>{diagnostic.latest_event.context.viewport.width} x {diagnostic.latest_event.context.viewport.height}</div>
-                  </div>
-                  <div style={{ backgroundColor: '#0d1017', padding: '10px', borderRadius: '6px', border: '1px solid #21283b' }}>
-                    <div style={{ color: '#8b949e', fontSize: '10px', marginBottom: '4px' }}>CRASH URL</div>
-                    <div style={{ fontWeight: 600, color: '#00f0ff', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{diagnostic.latest_event.context.url}</div>
-                  </div>
-                </div>
-              </div>
-
-            </div>
+            <DiagnosticPanel
+              diagnostic={diagnostic}
+              loading={loadingDiag}
+              onReanalyze={triggerReanalyze}
+              onResolve={() => updateStatus(diagnostic.issue_id, 'resolved')}
+              onIgnore={() => updateStatus(diagnostic.issue_id, 'ignored')}
+            />
           )}
-        </div>
+        </main>
 
       </div>
     </div>
